@@ -30,6 +30,9 @@ build:
 	go build -o bin/bench ./cmd/bench
 
 test:
+	QB_POSTGRES_URL='$(POSTGRES_URL)' go test ./...
+
+test-unit:
 	go test ./...
 
 bench: build
