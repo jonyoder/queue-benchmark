@@ -1,0 +1,25 @@
+# Binaries
+/bin/
+/bench
+*.exe
+*.test
+*.out
+
+# Dependencies
+/vendor/
+
+# Benchmark output
+/results/
+*.jsonl
+*.log
+
+# IDE
+.idea/
+.vscode/
+*.swp
+
+# macOS
+.DS_Store
+
+# Docker volumes
+/data/
