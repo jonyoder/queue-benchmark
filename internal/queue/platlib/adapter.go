@@ -1,115 +1,174 @@
 // Package platlib adapts the benchmark Harness contract to the
 // rstudio/platform-lib queue (pkg/rsqueue).
 //
-// Design notes
+// Architecture overview
 //
-// platform-lib's queue is lower-level than River: workers pull work
-// via an Agent loop, maintain permit heartbeats while processing, and
-// ack completion by deleting the permit. Work types are uint64-
-// discriminated, not string-kind-discriminated. The adapter maps our
-// string Kind values to stable uint64 type codes (see kindCode).
+// Unlike River, rsqueue is a set of primitives rather than a monolithic
+// client. The adapter composes them as follows:
 //
-// This adapter is a skeleton in Phase 2:
+//	pgxpool (DB)
+//	  └── pgStore (implements queue.QueueStore)
+//	        └── DatabaseQueue (implements queue.Queue)
+//	              └── DefaultAgent (worker loop, heartbeat, dispatch)
+//	                    └── RunnerFactory (dispatch by work type)
+//	                          └── benchRunner (our one runner, routes by Kind)
 //
-//   - Connection + migration happens in New.
-//   - Register records user WorkerFuncs.
-//   - Start launches the worker-loop goroutine pool.
-//   - Enqueue calls Push / AddressedPush.
-//   - Stop signals workers, waits for drain.
-//
-// The permit-heartbeat goroutine and worker-loop are sketched here with
-// TODO markers noting decisions that still require author (Jon's) review,
-// particularly: (a) the permit-heartbeat interval default, (b) how
-// priority maps from our Harness contract, and (c) whether we want to
-// exercise group-work semantics or leave them as a benchmark scenario.
+// Notifications flow through local.ListenerProvider → broadcaster →
+// three typed channels consumed by DatabaseQueue's internal broadcaster.
+// The adapter is single-process; cross-process notifications would
+// require swapping the local listener for the pgx one.
 package platlib
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5/pgxpool"
 
+	"github.com/rstudio/platform-lib/v3/pkg/rsnotify/broadcaster"
+	"github.com/rstudio/platform-lib/v3/pkg/rsnotify/listener"
+	"github.com/rstudio/platform-lib/v3/pkg/rsnotify/listeners/local"
+	"github.com/rstudio/platform-lib/v3/pkg/rsqueue/agent"
+	agenttypes "github.com/rstudio/platform-lib/v3/pkg/rsqueue/agent/types"
+	"github.com/rstudio/platform-lib/v3/pkg/rsqueue/impls/database"
+	"github.com/rstudio/platform-lib/v3/pkg/rsqueue/metrics"
+	plqueue "github.com/rstudio/platform-lib/v3/pkg/rsqueue/queue"
+	"github.com/rstudio/platform-lib/v3/pkg/rsqueue/runnerfactory"
+
 	qpkg "github.com/jonyoder/queue-benchmark/internal/queue"
 )
 
-// Harness implements qpkg.Harness against platform-lib's rsqueue.
+// Harness implements qpkg.Harness against rsqueue.
 type Harness struct {
-	cfg    qpkg.Config
-	router qpkg.KindToQueue
+	cfg  qpkg.Config
+	opts Options
 
 	pool    *pgxpool.Pool
+	store   *pgStore
+	queue   plqueue.Queue
+	agent   *agent.DefaultAgent
+	factory *runnerfactory.RunnerFactory
+
+	// Notification plumbing.
+	lp            *local.ListenerProvider
+	lf            *local.ListenerFactory
+	broadcaster   broadcaster.Broadcaster
+	bListener     listener.Listener
+	stopBroadcast chan bool
+	stopQueue     chan bool
+
 	mu      sync.RWMutex
 	workers map[qpkg.Kind]qpkg.WorkerFunc
-	typeOf  map[qpkg.Kind]uint64 // stable type code per Kind
 	started bool
-
-	stopCh chan struct{}
-	wg     sync.WaitGroup
 }
 
 // Options lets callers override adapter-specific defaults.
-//
-// TODO(jon): the right defaults for HeartbeatInterval and PermitMaxIdle
-// depend on platform-lib's permit expiration semantics. Suggested starting
-// points are placeholders; tune based on the author's guidance before
-// Phase 3 scenarios run.
 type Options struct {
-	// Router resolves Kind → queue name. If nil, qpkg.DefaultRouter.
-	Router qpkg.KindToQueue
-
-	// HeartbeatInterval controls how often workers extend their permits.
-	// Must be shorter than the queue's permit expiration. If zero, a
-	// TODO-driven default is used once wiring lands (see TODO below).
-	HeartbeatInterval time.Duration
-
-	// DefaultPriority is the priority used for Enqueue calls (platform-lib
-	// is priority-aware; our Harness contract is not). Lower = higher
-	// priority. 0 is highest.
+	// DefaultPriority is the priority used for Enqueue calls (rsqueue is
+	// priority-aware; our Harness contract is not). Lower = higher
+	// priority. 0 is highest. Default: 10 (arbitrary middle ground).
 	DefaultPriority uint64
+
+	// UseAddressedPush, if true, uses AddressedPush for every enqueue with
+	// a synthetic unique address ("bench:{uuid}"). Default is false (plain
+	// Push) to mirror River's behavior. Scenarios that want dedup semantics
+	// can flip this.
+	UseAddressedPush bool
 }
 
-// New returns a platform-lib-backed harness.
-//
-// TODO(jon): choose the queue implementation. rsqueue has implementations
-// under pkg/rsqueue/impls — the Postgres one should align with our
-// docker-compose Postgres. Wire the concrete queue.Queue constructor here.
+// New returns an rsqueue-backed harness. Postgres connection is opened,
+// schema is applied, notification plumbing is wired, and DatabaseQueue is
+// constructed. No workers run until Start is called.
 func New(ctx context.Context, cfg qpkg.Config, opts Options) (*Harness, error) {
 	if err := cfg.Validate(); err != nil {
 		return nil, fmt.Errorf("platlib adapter: %w", err)
 	}
-	router := opts.Router
-	if router == nil {
-		router = qpkg.DefaultRouter
+	if opts.DefaultPriority == 0 {
+		opts.DefaultPriority = 10
 	}
 
 	pool, err := pgxpool.New(ctx, cfg.PostgresURL)
 	if err != nil {
 		return nil, fmt.Errorf("platlib adapter: connect postgres: %w", err)
 	}
+	if err := applySchema(ctx, pool); err != nil {
+		pool.Close()
+		return nil, fmt.Errorf("platlib adapter: %w", err)
+	}
 
-	// TODO(jon): run platform-lib's schema migrations for rsqueue here.
-	// The adapter should be self-contained: calling New on a clean DB
-	// leaves the DB ready to accept Enqueue calls. For apples-to-apples
-	// measurement with the River adapter (which auto-migrates), this
-	// adapter should too.
+	// Local listener + factory + broadcaster for in-process NOTIFY.
+	lp := local.NewListenerProvider(local.ListenerProviderArgs{})
+	lf := local.NewListenerFactory(lp)
 
-	return &Harness{
-		cfg:     cfg,
-		router:  router,
-		pool:    pool,
-		workers: make(map[qpkg.Kind]qpkg.WorkerFunc),
-		typeOf:  make(map[qpkg.Kind]uint64),
-		stopCh:  make(chan struct{}),
-	}, nil
+	matcher := listener.NewMatcher("NotifyType")
+	matcher.Register(notifyTypeQueue, &queueDbNote{})
+	matcher.Register(notifyTypeWorkComplete, &agenttypes.WorkCompleteNotification{})
+	matcher.Register(notifyTypeChunk, &chunkNote{})
+
+	bl := lf.New(channelMessages, matcher)
+	stopBroadcast := make(chan bool)
+	b, err := broadcaster.NewNotificationBroadcaster(bl, stopBroadcast)
+	if err != nil {
+		pool.Close()
+		bl.Stop()
+		lf.Shutdown()
+		return nil, fmt.Errorf("platlib adapter: new broadcaster: %w", err)
+	}
+
+	queueMsgs := b.Subscribe(notifyTypeQueue)
+	workMsgs := b.Subscribe(notifyTypeWorkComplete)
+	chunkMsgs := b.Subscribe(notifyTypeChunk)
+
+	// Store is notifier-aware so its push operations fan out in-process
+	// without needing Postgres NOTIFY round-trips.
+	store := newPgStore(pool, localNotifier{lp: lp})
+
+	stopQueue := make(chan bool)
+	q, err := database.NewDatabaseQueue(database.DatabaseQueueConfig{
+		QueueName:              benchQueueName,
+		NotifyTypeWorkReady:    notifyTypeQueue,
+		NotifyTypeWorkComplete: notifyTypeWorkComplete,
+		NotifyTypeChunk:        notifyTypeChunk,
+		ChunkMatcher:           noChunkMatcher{},
+		CarrierFactory:         &metrics.EmptyCarrierFactory{},
+		QueueStore:             store,
+		QueueMsgsChan:          queueMsgs,
+		WorkMsgsChan:           workMsgs,
+		ChunkMsgsChan:          chunkMsgs,
+		StopChan:               stopQueue,
+		JobLifecycleWrapper:    &metrics.EmptyJobLifecycleWrapper{},
+	})
+	if err != nil {
+		pool.Close()
+		bl.Stop()
+		lf.Shutdown()
+		return nil, fmt.Errorf("platlib adapter: new queue: %w", err)
+	}
+
+	h := &Harness{
+		cfg:           cfg,
+		opts:          opts,
+		pool:          pool,
+		store:         store,
+		queue:         q,
+		lp:            lp,
+		lf:            lf,
+		broadcaster:   b,
+		bListener:     bl,
+		stopBroadcast: stopBroadcast,
+		stopQueue:     stopQueue,
+		workers:       make(map[qpkg.Kind]qpkg.WorkerFunc),
+	}
+	return h, nil
 }
 
-// Register records the user's worker for a Kind and assigns a stable
-// uint64 type code for platform-lib's Work discriminator.
+// Register records a user worker for a Kind.
 func (h *Harness) Register(kind qpkg.Kind, fn qpkg.WorkerFunc) error {
 	h.mu.Lock()
 	defer h.mu.Unlock()
@@ -120,61 +179,114 @@ func (h *Harness) Register(kind qpkg.Kind, fn qpkg.WorkerFunc) error {
 		return fmt.Errorf("platlib adapter: Kind %q already registered", kind)
 	}
 	h.workers[kind] = fn
-	h.typeOf[kind] = kindCode(kind)
 	return nil
 }
 
-// Start launches the worker-loop goroutine pool.
-//
-// TODO(jon): implement the Agent loop. Each worker goroutine should:
-//
-//  1. Call queue.Get(ctx, maxPriority, priorityChan, supportedTypes, stopCh)
-//     to obtain work. This blocks until work is available or the loop is
-//     asked to stop.
-//  2. Resolve the WorkerFunc by the work's Type() uint64 → Kind via h.typeOf reverse lookup.
-//  3. Launch a heartbeat goroutine that calls queue.Extend(permit) at
-//     HeartbeatInterval until the work is done.
-//  4. Invoke the WorkerFunc; on success, call queue.Delete(permit); on
-//     failure, call queue.RecordFailure(address, err) for addressed work,
-//     or requeue for priority-only work.
-//  5. Repeat.
+// Start wires the RunnerFactory + Agent and launches the worker loop.
 func (h *Harness) Start(ctx context.Context) error {
 	h.mu.Lock()
-	defer h.mu.Unlock()
 	if h.started {
+		h.mu.Unlock()
 		return errors.New("platlib adapter: Start called twice")
 	}
-	// TODO(jon): launch N worker goroutines per queue config.
+	h.mu.Unlock()
+
+	supported := &plqueue.DefaultQueueSupportedTypes{}
+	factory := runnerfactory.NewRunnerFactory(runnerfactory.RunnerFactoryConfig{
+		SupportedTypes: supported,
+	})
+	// Register one runner per Kind. The RunnerFactory.Add call also flags
+	// the work type as enabled on SupportedTypes.
+	h.mu.RLock()
+	for kind := range h.workers {
+		wt := kindCode(kind)
+		factory.Add(wt, &benchRunner{h: h, kind: kind})
+	}
+	h.mu.RUnlock()
+	h.factory = factory
+
+	// Concurrency enforcer: total worker slots = sum of cfg.Queues.
+	// rsqueue's Concurrencies is priority-aware — callers pass a per-
+	// priority concurrency budget. We budget at priority 0 (the default
+	// we enqueue at) and fall back to the same value for higher priorities.
+	totalWorkers := 0
+	for _, qc := range h.cfg.Queues {
+		totalWorkers += qc.MaxWorkers
+	}
+	pri := int64(h.opts.DefaultPriority)
+	defaults := map[int64]int64{pri: int64(totalWorkers)}
+	enforcer, err := agent.Concurrencies(defaults, nil, []int64{pri})
+	if err != nil {
+		return fmt.Errorf("platlib adapter: concurrencies: %w", err)
+	}
+
+	ag := agent.NewAgent(agent.AgentConfig{
+		WorkRunner:             factory,
+		Queue:                  h.queue,
+		ConcurrencyEnforcer:    enforcer,
+		SupportedTypes:         supported,
+		NotifyTypeWorkComplete: notifyTypeWorkComplete,
+		JobLifecycleWrapper:    &metrics.EmptyJobLifecycleWrapper{},
+	})
+	h.agent = ag
+
+	// Agent Run callback: relay WorkComplete notifications through our
+	// local provider so PollAddress (subscribed on the broadcaster) sees
+	// them. Without this, addressed-work pollers fall back to the 5s poll.
+	notifyFn := func(n listener.Notification) {
+		h.lp.Notify(channelMessages, n)
+	}
+
+	h.mu.Lock()
 	h.started = true
+	h.mu.Unlock()
+
+	// Run the agent loop in its own goroutine; shutdown happens via Stop.
+	go func() {
+		ag.Run(ctx, notifyFn)
+	}()
 	return nil
 }
 
-// Enqueue maps to queue.Push for non-addressed work.
-//
-// TODO(jon): decide whether to use Push or AddressedPush by default.
-// AddressedPush gives dedup-by-address which maps well to unique-jobs-per-period
-// scenarios (river has UniqueOpts for this). The Harness contract doesn't
-// expose uniqueness; benchmark scenarios that want dedup can use library-
-// specific options via the constructor's Options struct.
+// Enqueue pushes one job to the rsqueue.
 func (h *Harness) Enqueue(ctx context.Context, tenantID uuid.UUID, kind qpkg.Kind, payload qpkg.JobPayload) (qpkg.JobID, error) {
 	h.mu.RLock()
-	if !h.started {
-		h.mu.RUnlock()
+	started := h.started
+	_, known := h.workers[kind]
+	h.mu.RUnlock()
+	if !started {
 		return "", errors.New("platlib adapter: Enqueue before Start")
 	}
-	code, ok := h.typeOf[kind]
-	h.mu.RUnlock()
-	if !ok {
+	if !known {
 		return "", fmt.Errorf("platlib adapter: no worker registered for kind %q", kind)
 	}
-	_ = code     // TODO(jon): build queue.Work with Type() returning code
-	_ = tenantID // TODO(jon): carry tenant_id through Work serialization
-	_ = payload
-	return "", errors.New("platlib adapter: Enqueue not yet implemented")
+
+	workID := nextWorkID()
+	work := benchWork{
+		WorkID:      workID,
+		TenantIDStr: tenantID.String(),
+		KindStr:     string(kind),
+		Payload:     payload,
+	}
+
+	if h.opts.UseAddressedPush {
+		addr := fmt.Sprintf("bench:%d", workID)
+		if err := h.queue.AddressedPush(ctx, h.opts.DefaultPriority, 0, addr, work); err != nil {
+			return "", err
+		}
+		return qpkg.JobID(addr), nil
+	}
+	if err := h.queue.Push(ctx, h.opts.DefaultPriority, 0, work); err != nil {
+		return "", err
+	}
+	return qpkg.JobID(fmt.Sprintf("bench:%d", workID)), nil
 }
 
-// EnqueueMany is a loop over Enqueue for now. platform-lib's queue
-// does not appear to expose a native bulk path (verify with author).
+// EnqueueMany is currently a loop — rsqueue's Queue interface doesn't
+// expose a native bulk path. The loop still benefits from our store's
+// post-commit-notify batching when a single Harness.EnqueueMany caller
+// wraps its loop in one transaction; that's not done here, so each push
+// is its own tx (consistent with the River adapter's behavior).
 func (h *Harness) EnqueueMany(ctx context.Context, jobs []qpkg.EnqueueRequest) ([]qpkg.JobID, error) {
 	out := make([]qpkg.JobID, 0, len(jobs))
 	for _, j := range jobs {
@@ -187,8 +299,8 @@ func (h *Harness) EnqueueMany(ctx context.Context, jobs []qpkg.EnqueueRequest) (
 	return out, nil
 }
 
-// Stats surfaces what platform-lib exposes via its queue interface.
-// TODO(jon): platform-lib's Peek could back this; decide on a cheap query.
+// Stats returns a point-in-time view. rsqueue does not surface aggregate
+// counts cheaply; Peek reads unclaimed rows.
 func (h *Harness) Stats(ctx context.Context) (qpkg.Stats, error) {
 	totalWorkers := 0
 	for _, qc := range h.cfg.Queues {
@@ -197,35 +309,129 @@ func (h *Harness) Stats(ctx context.Context) (qpkg.Stats, error) {
 	return qpkg.Stats{WorkersTotal: totalWorkers}, nil
 }
 
-// Stop signals worker loops and waits for drain.
+// Stop drains the agent, broadcaster, listener factory, and DB pool.
 func (h *Harness) Stop(ctx context.Context) error {
 	h.mu.Lock()
 	if !h.started {
 		h.mu.Unlock()
+		h.pool.Close()
 		return nil
 	}
 	h.started = false
-	close(h.stopCh)
+	ag := h.agent
 	h.mu.Unlock()
 
-	done := make(chan struct{})
-	go func() {
-		h.wg.Wait()
-		close(done)
-	}()
+	if ag != nil {
+		if err := ag.Stop(h.cfg.ShutdownTimeout); err != nil && !errors.Is(err, agent.ErrAgentStopTimeout) {
+			return fmt.Errorf("platlib adapter: stop agent: %w", err)
+		}
+	}
+	if h.factory != nil {
+		_ = h.factory.Stop(h.cfg.ShutdownTimeout)
+	}
+	// Signal the DatabaseQueue broadcaster to stop.
 	select {
-	case <-done:
-	case <-ctx.Done():
-		return ctx.Err()
+	case h.stopQueue <- true:
+	default:
+	}
+	// Signal the notification broadcaster to stop.
+	select {
+	case h.stopBroadcast <- true:
+	default:
+	}
+	if h.lf != nil {
+		h.lf.Shutdown()
 	}
 	h.pool.Close()
 	return nil
 }
 
-// kindCode returns a stable uint64 type code for a Kind. The mapping is
-// fnv-1a of the Kind string so ordering is consistent across runs without
-// a central registry. platform-lib's queue discriminator is uint64 — the
-// actual value isn't semantic, only stable identity matters.
+// --- supporting types ---
+
+// benchWork is the Work payload carried through rsqueue. Kind and TenantID
+// travel inside it because rsqueue doesn't have first-class tenant scope.
+type benchWork struct {
+	WorkID      uint64         `json:"work_id"`
+	TenantIDStr string         `json:"tenant_id"`
+	KindStr     string         `json:"kind"`
+	Payload     qpkg.JobPayload `json:"payload"`
+}
+
+// Type satisfies rsqueue's Work interface. We key the worker type on
+// the Kind via a stable fnv-1a hash (see kindCode). The returned value
+// is resolved by the RunnerFactory at dispatch time.
+func (w benchWork) Type() uint64 { return kindCode(qpkg.Kind(w.KindStr)) }
+
+// Address satisfies rsqueue.AddressableWork when UseAddressedPush is true.
+func (w benchWork) Address() string { return fmt.Sprintf("bench:%d", w.WorkID) }
+
+// Dir is required by AddressableWork; unused in this benchmark.
+func (w benchWork) Dir() string { return "" }
+
+// benchRunner dispatches a benchmark job to the user-registered WorkerFunc
+// for its Kind.
+type benchRunner struct {
+	plqueue.BaseRunner
+	h    *Harness
+	kind qpkg.Kind
+}
+
+func (r *benchRunner) Run(ctx context.Context, work plqueue.RecursableWork) error {
+	var bw benchWork
+	if err := json.Unmarshal(work.Work, &bw); err != nil {
+		return fmt.Errorf("platlib runner: unmarshal: %w", err)
+	}
+	tenantID, err := uuid.Parse(bw.TenantIDStr)
+	if err != nil {
+		return fmt.Errorf("platlib runner: tenant id: %w", err)
+	}
+	kind := qpkg.Kind(bw.KindStr)
+
+	r.h.mu.RLock()
+	fn, ok := r.h.workers[kind]
+	r.h.mu.RUnlock()
+	if !ok {
+		return fmt.Errorf("platlib runner: no worker registered for kind %q", kind)
+	}
+	bj := qpkg.Job{
+		ID:         qpkg.JobID(bw.Address()),
+		TenantID:   tenantID,
+		Kind:       kind,
+		Payload:    bw.Payload,
+		Attempt:    1, // rsqueue doesn't track attempts natively; always 1 on first run
+		EnqueuedAt: time.Now(), // best-effort; the Work row has created_at but isn't plumbed through RecursableWork
+	}
+	return fn(ctx, bj)
+}
+
+// chunkNote is a placeholder wire type registered so the broadcaster
+// matcher can route (empty) chunk notifications. The benchmark doesn't
+// use chunked storage.
+type chunkNote struct {
+	NotifyType uint8 `json:"NotifyType"`
+}
+
+func (c chunkNote) Type() uint8 { return c.NotifyType }
+func (chunkNote) Guid() string  { return "" }
+
+// noChunkMatcher satisfies queue.DatabaseQueueChunkMatcher with a never-match.
+type noChunkMatcher struct{}
+
+func (noChunkMatcher) Match(_ listener.Notification, _ string) bool { return false }
+
+// localNotifier adapts a local.ListenerProvider to our store's pgNotifier
+// interface. ListenerProvider.Notify doesn't return an error; we wrap
+// it to satisfy the store's typed contract.
+type localNotifier struct {
+	lp *local.ListenerProvider
+}
+
+func (l localNotifier) Notify(channel string, n any) error {
+	l.lp.Notify(channel, n)
+	return nil
+}
+
+// kindCode returns a stable uint64 type code for a Kind via fnv-1a.
 func kindCode(k qpkg.Kind) uint64 {
 	const (
 		offset64 = 14695981039346656037
@@ -239,5 +445,10 @@ func kindCode(k qpkg.Kind) uint64 {
 	return h
 }
 
-// Compile-time check that Harness satisfies qpkg.Harness.
+// nextWorkID yields a monotonic id for synthetic addresses.
+var workIDCounter atomic.Uint64
+
+func nextWorkID() uint64 { return workIDCounter.Add(1) }
+
+// Compile-time interface check.
 var _ qpkg.Harness = (*Harness)(nil)
