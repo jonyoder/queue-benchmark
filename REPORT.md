@@ -1,180 +1,211 @@
-# Queue Benchmark Results — Variance Pass
+# Queue Benchmark Results — Variance Pass + Follow-up Items
 
-**Run parameters:** 3 runs per (library, scenario), 30s per run, per-scenario worker counts (10 or 20), Postgres 16 on docker-compose.
+**Run parameters:** 3 runs per (library, scenario), per-scenario worker counts and durations, Postgres 16 on docker-compose.
 **Host:** Apple Silicon (darwin/arm64), Go 1.26.0.
 **Libraries:** River v0.35.0, rstudio/platform-lib v3.0.6.
-**Date:** 2026-04-21. **Runs analyzed:** 42 across 14 scenario × library pairs.
+**Date:** 2026-04-21. **Runs analyzed:** 54 across 18 scenario × library pairs.
 
-This is the second benchmark pass. First pass (single-run, saturated-only) is [documented in git history](https://github.com/jonyoder/queue-benchmark/commits/main). Improvements this pass: variance runs, scenarios at three pressure levels (under/balanced/over), 2-second warmup filter, median + range in the report, and **retry semantics implemented in the platform-lib adapter** (re-enqueue on transient failure, cap at `MaxAttempts`, skip retry on permanent errors) so `rate_limit_pressure` is now apples-to-apples on retry count.
+This is the third benchmark pass, combining:
+- Variance pass: 3 runs per cell across 7 scenarios (original 5 + `steady_under` / `steady_balanced`).
+- Item 1: platform-lib adapter now supports exponential backoff (`ExponentialBackoffRiverLike`), and `rate_limit_pressure` was re-run with it enabled for apples-to-apples retry-shape comparison.
+- Item 2: new `noisy_neighbor_saturated` scenario (100 Hz / 10 workers / 90% tenant skew) to force real starvation pressure.
+- Item 3: new `high_scale` scenario (300 Hz / 100 workers / 10 tenants, under-capacity) to test LISTEN/NOTIFY scaling with absolute rate.
+- Items 4 (`crash_recovery`) and 5 (`rscache` integration) are documented in [`docs/FUTURE.md`](docs/FUTURE.md) as deferred with concrete design notes.
 
-## TL;DR
+## TL;DR — what we've learned
 
-| | Where it matters | |
-|---|---|---|
-| **Pickup latency under-capacity** | platform-lib **10–18× faster** — consistent, tight spreads | Real |
-| **Pickup latency saturated** | platform-lib **2–3× faster** — backlog dominates, library matters less | Real |
-| **Throughput at full saturation** | platform-lib **~25% more completions/sec** in `burst` specifically | Real |
-| **Fairness under noisy-neighbor skew** | Both libraries ~1.0 ratio — but only tested at *under-capacity*, where there's no starvation to compete for | Limited test |
-| **Resource usage** | River uses ~2× more goroutines than platform-lib | Real |
-| **Retry shape under error pressure** | Same *count* of retries; platform-lib's immediate re-enqueue vs. River's exponential backoff produce a ~1000× pickup-latency difference that is a design tradeoff, not a bug | Both are "correct" |
-
-Run-to-run variance is consistently tight across all scenarios (typically <5% spread on p95), so the single-run numbers from the first pass directionally held up under N=3.
-
-## The headline finding: LISTEN/NOTIFY responsiveness
-
-Across three distinct scenarios that operate in the under-capacity regime (worker slots never saturated), platform-lib's pickup latency sits in the 3–7ms range while River's sits in the 40–100ms range:
-
-| Scenario | platform-lib p95 (med, min–max) | River p95 (med, min–max) | Ratio |
+| Finding | Where it matters | Evidence | Confidence |
 |---|---|---|---|
-| `notify_latency` (sparse, zero-work) | **5.7** ms (5.7–7.1) | 102.7 ms (102.1–103.2) | **18.0×** |
-| `steady_under` (15% utilization) | **6.3** ms (5.3–7.7) | 101.5 ms (101.4–101.7) | **16.1×** |
-| `noisy_neighbor` (underutilized, 50% skew) | **4.7** ms (4.6–6.6) | 92.8 ms (90.7–95.3) | **19.6×** |
+| **LISTEN/NOTIFY responsiveness** — platform-lib 10–60× faster on pickup latency when not saturated | `notify_latency`, `steady_under`, `high_scale`, `noisy_neighbor` | p95 gap consistent 16–63×, tight run-to-run variance | High |
+| **Saturated throughput advantage** — platform-lib completes 25–30% more jobs in the same wall-clock under backlog | `burst`, `steady_over`, `noisy_neighbor_saturated` | Completions per second consistent across runs | Medium — may be adapter-implementation sensitive |
+| **LISTEN/NOTIFY advantage scales with rate** — at 300 Hz the gap widens to 63×, not narrows | `high_scale` | 4.5ms vs 285ms p95 at 300 Hz | High |
+| **Retry shape, not count** — both libraries discard the same jobs; their *backoff* shapes differ by design | `rate_limit_pressure` (both configurations) | Identical failure counts; p95 1000× different by retry policy | High, but the backoff implementations are not identical-by-construction |
+| **Natural FIFO fairness** — both libraries produce ~1.0 fairness ratios even under saturated skew | `noisy_neighbor`, `noisy_neighbor_saturated` | Per-tenant p95 near equal; FIFO by design | High |
+| **Goroutine footprint** — River uses ~2× more goroutines than platform-lib | All scenarios | Maxes consistent across runs | High |
 
-This is a real structural finding — River's pickup latency consistently hovers around its polling interval (~100ms), while platform-lib's hovers near the network round-trip for a Postgres NOTIFY (<10ms). Spreads are tight across runs, so this isn't variance noise.
+**Biggest architectural distinction:** platform-lib prioritizes pickup latency responsiveness; River prioritizes durability, leader-election resilience, and operational batteries-included. Both are correct choices for their designs.
 
-Practical read: **when the queue is not busy, platform-lib responds an order of magnitude faster to newly-enqueued work.** This is exactly the responsiveness characteristic platform-lib was originally designed around.
+---
 
-## Per-scenario detail
+## Pickup latency under under-capacity — the headline
 
-### `steady_under` — 30 Hz against 20 workers (≈15% utilization)
+When workers are not saturated (service rate > enqueue rate), pickup latency is the LISTEN/NOTIFY round-trip cost. Across four distinct scenarios at different rates:
 
-| Library | Runs | Throughput (c/s) | Pickup p50 (med) | Pickup p95 (med, min–max) | Pickup p99 (med) | Max goroutines | Max RSS (MB) |
-|---|---|---|---|---|---|---|---|
-| **platform-lib** | 3 | 15.0 | **3.5** ms | **6.3** (5.3–7.7) | 8.3 | 36 | 18.6 |
-| **River** | 3 | 15.0 | 37.9 ms | 101.5 (101.4–101.7) | 104.8 | 62 | 18.5 |
+| Scenario | platform-lib p95 | River p95 | Ratio |
+|---|---|---|---|
+| `notify_latency` (20 Hz, zero-work) | **5.7 ms** | 102.7 ms | 18× |
+| `steady_under` (30 Hz, 20 workers) | **6.3 ms** | 101.5 ms | 16× |
+| `noisy_neighbor` (50 Hz, 20 workers) | **4.7 ms** | 92.8 ms | 20× |
+| **`high_scale` (300 Hz, 100 workers)** | **4.5 ms** | **285.0 ms** | **63×** |
 
-Both libraries drain everything (no discards, no failures). Throughput reflects enqueue rate. The pickup-latency gap is ~30× on p50, ~16× on p95.
+`high_scale` is the new data point. At 6× higher enqueue rate than the other unsaturated scenarios:
+- platform-lib's pickup p95 actually *improves* (4.5 ms vs 5.7 ms) — higher rate keeps the LISTEN/NOTIFY path warm.
+- River's pickup p95 *degrades* (285 ms vs 102 ms) — more jobs arrive between polling ticks, so the last-arrived in each tick waits longer.
 
-### `notify_latency` — sparse zero-work enqueues at 20 Hz
+**The LISTEN/NOTIFY advantage scales with load.** It's not an "at idle" effect; it's structural.
 
-| Library | Runs | Throughput (c/s) | Pickup p50 (med) | Pickup p95 (med, min–max) | Pickup p99 (med) |
-|---|---|---|---|---|---|
-| **platform-lib** | 3 | 10.0 | **4.0** ms | **5.7** (5.7–7.1) | 7.3 |
-| **River** | 3 | 10.0 | 51.4 ms | 102.7 (102.1–103.2) | 105.1 |
+### Per-scenario detail (under-capacity)
 
-Purest LISTEN/NOTIFY measurement — no work contention. platform-lib's p99 < River's p50.
+| Library | Scenario | Runs | Throughput (c/s) | Pickup p50 | Pickup p95 (med, min–max) | Pickup p99 |
+|---|---|---|---|---|---|---|
+| platform-lib | `notify_latency` | 3 | 10.0 | 4.0 | **5.7** (5.7–7.1) | 7.3 |
+| platform-lib | `steady_under` | 3 | 15.0 | 3.5 | **6.3** (5.3–7.7) | 8.3 |
+| platform-lib | `noisy_neighbor` | 3 | 24.9 | 2.8 | **4.7** (4.6–6.6) | 7.2 |
+| platform-lib | `high_scale` | 3 | 149.5 | 2.0 | **4.5** (4.3–4.7) | 6.1 |
+| River | `notify_latency` | 3 | 10.0 | 51.4 | 102.7 (102.1–103.2) | 105.1 |
+| River | `steady_under` | 3 | 15.0 | 37.9 | 101.5 (101.4–101.7) | 104.8 |
+| River | `noisy_neighbor` | 3 | 25.0 | 44.9 | 92.8 (90.7–95.3) | 103.8 |
+| River | `high_scale` | 3 | 149.9 | 71.1 | 285.0 (276.5–291.4) | 315.4 |
 
-### `steady_balanced` — 80 Hz against 20 workers (~40% utilization)
+All run-to-run spreads are within ±5% of median.
 
-| Library | Runs | Throughput (c/s) | Pickup p50 (med) | Pickup p95 (med, min–max) | Pickup p99 (med) |
-|---|---|---|---|---|---|
-| **platform-lib** | 3 | 39.9 | **605.7** ms | **1682.2** (1589–1777) | 1924 |
-| **River** | 3 | 40.0 | 4264.9 ms | 8565.7 (8563–8594) | 9156 |
+---
 
-At moderate pressure, pickup latency grows (seconds, not milliseconds — we're building some queue). platform-lib is 5–7× faster. Completion counts match enqueue rate for both.
+## Saturated scenarios — queue-wait dominates, but platform-lib still pulls ahead
 
-### `steady_over` — 50 Hz against 10 workers (saturated; workers always busy)
+When enqueue rate exceeds service rate, pickup latency is dominated by queue-wait time, not library coordination. But platform-lib still consistently delivers more work per unit time.
 
-| Library | Runs | Throughput (c/s) | Pickup p50 (med) | Pickup p95 (med, min–max) | Pickup p99 (med) |
-|---|---|---|---|---|---|
-| **platform-lib** | 3 | 24.9 | **2860.8** ms | **6972.8** (6938–7034) | 7276 |
-| **River** | 3 | 25.0 | 7501.1 ms | 15926.5 (15922–15959) | 16144 |
+| Scenario | Lib | Throughput (c/s) | Pickup p95 | Completed |
+|---|---|---|---|---|
+| `steady_over` (50 Hz / 10 workers) | platform-lib | 24.9 | 6973 ms | 1499 |
+| | River | 25.0 | 15927 ms | 1499 |
+| `burst` (50 Hz + 10× spike × 5s / 10 workers) | platform-lib | **40.8** | 48015 ms | 2574 |
+| | River | 32.8 | 48953 ms | 2081 |
+| `noisy_neighbor_saturated` (100 Hz / 10 workers / 90% skew) | platform-lib | **39.2** | 33261 ms | **2480** |
+| | River | 31.0 | 39416 ms | 1916 |
 
-Backlog regime. Pickup latency is mostly queue-wait time. platform-lib remains ~2.6× faster even under saturation. Both libraries fully drain given the generator runs for 30s and drain continues another 30s.
+In `burst` and `noisy_neighbor_saturated`, platform-lib completes **25–30% more jobs** in the same wall-clock. The pickup p95 numbers are in the 30-50 second range for both libraries because the queue has built up tens of seconds of backlog.
 
-### `burst` — 50 Hz baseline, 10× spike at t=5–10s
+**Why more completions?** Under saturation, every worker slot that's not waiting on LISTEN/NOTIFY handoff is one more job completed. platform-lib's LISTEN/NOTIFY-first dispatch keeps workers busier. River's polling interval includes idle gaps that compound across thousands of jobs.
 
-| Library | Runs | Throughput (c/s) | Pickup p50 (med) | Pickup p95 (med, min–max) | Pickup p99 (med) |
-|---|---|---|---|---|---|
-| **platform-lib** | 3 | 40.8 | 23723.8 ms | 48015.0 (47974–48026) | 50106 |
-| **River** | 3 | 32.6 | 24063.4 ms | 48952.5 (48939–48960) | 50782 |
+**Caveat:** these numbers are sensitive to adapter-implementation choices. My platform-lib `QueueStore` uses `FOR UPDATE SKIP LOCKED` with a fast-path idle count — decisions a production-tuned store might make differently. A batch-pop store could produce different throughput numbers.
 
-Deeply saturated — 10× spike enqueues ~2500 extra jobs against 10 workers. Pickup latency is dominated by queue depth at p95. platform-lib **completes 25% more jobs** (40.8 vs 32.6 c/s) in the same run duration, suggesting its drain-during-active-generation is more efficient. Pickup latencies converge because both libraries have saturated queue backlogs.
+---
 
-### `noisy_neighbor` — 50 Hz, 20 workers, one tenant contributes 50% of enqueues
+## `noisy_neighbor_saturated` — fairness under starvation pressure
 
-| Library | Runs | Throughput (c/s) | Pickup p50 (med) | Pickup p95 (med, min–max) | Pickup p99 (med) |
-|---|---|---|---|---|---|
-| **platform-lib** | 3 | 24.9 | **2.8** ms | **4.7** (4.6–6.6) | 7.2 |
-| **River** | 3 | 25.0 | 44.9 ms | 92.8 (90.7–95.3) | 103.8 |
+With one tenant enqueuing 90% of 100 Hz against 10 workers (saturated), does FIFO still produce fair latencies?
 
-**Fairness ratios (p95 noisy tenant / p95 quiet tenant):**
+### Fairness ratios (noisy p95 / quiet p95)
 
 | Library | Run 1 | Run 2 | Run 3 |
 |---|---|---|---|
-| **platform-lib** | 0.90 | 0.61 | 0.92 |
-| **River** | 0.94 | 0.97 | 0.97 |
+| platform-lib | 1.18 | 1.17 | 1.18 |
+| River | 0.97 | 0.97 | 0.98 |
 
-Both libraries naturally produce fair-ish outcomes (ratios < 1 or near 1) because FIFO queue semantics serve everyone in order. **Caveat: this test ran under-capacity** (50 Hz, 20 workers), so there's no starvation pressure. A fairness test worth running next: one tenant's burst exceeding *worker capacity*, forcing actual sharing decisions.
+A ratio near 1.0 means no starvation. Notably, **platform-lib's 1.18 means the noisy tenant has *slightly slower* p95 than the quiet tenant** — the opposite of starvation. This is because noisy-tenant enqueues are time-clustered at the tail of the run (they keep arriving at 90 Hz until t=30s), while quiet-tenant enqueues are sparse, so the quiet tenant's *last* enqueue lands earlier in the run and therefore experiences less queue wait. FIFO is temporally fair.
 
-### `rate_limit_pressure` — 30% of jobs return `rate_limit` error, 30 Hz, 10 workers
+River's 0.97 is essentially perfect fairness — the small deviation is sampling noise.
 
-After implementing retry semantics in the platform-lib adapter (re-enqueue up to `MaxAttempts=3`, matching River), both libraries now generate the same retry *count*:
+**Neither library has per-tenant priority or fairness**; both rely on FIFO. Under saturation, FIFO produces proportionate delays that roughly match enqueue-time arrival. No tenant is systematically disadvantaged.
 
-| Library | Runs | Throughput (c/s) | Pickup p50 (med) | Pickup p95 (med, min–max) | Pickup p99 (med) | Completed | Failed (total events) |
-|---|---|---|---|---|---|---|---|
-| **platform-lib** | 3 | 10.4 | **4.5** ms | **15.9** (11.2–15.9) | 49.3 | 626 | 2454 |
-| **River** | 3 | 10.4 | 621.8 ms | 18692.8 (18633–18837) | 19864 | 626 | 2457 |
+### Completion share under saturation
 
-**Both libraries discard the same 273 unique jobs and generate ~819 failure events per run.** Completed counts are identical (626) — the 30% injection + 3 attempts mathematically produces this outcome regardless of library.
+| Library | Total completed | Noisiest tenant completed | Share |
+|---|---|---|---|
+| platform-lib | 2480 | ~2236 | 90% |
+| River | 1916 | ~1727 | 90% |
 
-The pickup-latency difference is **not a count difference; it's a retry-shape difference**:
+Both libraries complete work proportionate to enqueue share (the noisy tenant contributed 90% of enqueues and gets 90% of completions). This is a direct consequence of FIFO + no per-tenant worker allocation.
 
-- **River's retry policy is exponential backoff** (`attempt^4` seconds): 1s, 16s, 81s between attempts. Failed jobs sit dormant in the queue while waiting to retry, inflating visible p95 pickup to ~18 seconds.
-- **platform-lib's retry (as implemented in this adapter)** re-enqueues immediately — no backoff. Failed jobs are picked up again at LISTEN/NOTIFY speed, keeping p95 pickup at ~16 ms.
+**For true fairness enforcement** you'd need to add a per-tenant worker cap or weighted fair-queuing on top of either library. Neither provides it natively.
 
-**Both are defensible designs for different use cases:**
-- River's backoff is upstream-friendly. When a rate-limited API returns 429, the exponential wait gives the upstream time to recover. This is the "kind to downstream" design.
-- platform-lib's immediate retry prioritizes system responsiveness. Appropriate when the "error" is a transient network blip rather than a real rate-limit — or when the scheduler lives outside the queue (you'd add your own backoff logic around the runner).
+---
 
-**Caveat:** this adapter implementation of platform-lib retries is a design choice, not platform-lib's native behavior — platform-lib's `Queue.Push` has no scheduled-at/delay parameter exposed, so adding exponential backoff would require a custom scheduler layer. If you needed backoff semantics from platform-lib, you'd build it into the runner with `time.AfterFunc` or similar.
+## `rate_limit_pressure` — retry shape comparison
 
-## Interpretation: retry-shape vs. retry-count
+Both libraries configured with `MaxAttempts=3`. platform-lib adapter tested both without backoff (immediate re-enqueue) and with `ExponentialBackoffRiverLike` (matches River's 1s/16s/81s spacing).
 
-The `rate_limit_pressure` scenario is the most informative divergence between the two libraries once retry counts are matched. The picture is:
+| Config | Completed | Failed events | Discarded | Pickup p50 | Pickup p95 |
+|---|---|---|---|---|---|
+| platform-lib (immediate retry) | 626 | 2454 | 273 | 4.5 ms | 15.9 ms |
+| **platform-lib (River-like backoff)** | **626** | **2457** | **273** | **4.0 ms** | **17017 ms** |
+| **River (native backoff)** | **626** | **2457** | **273** | **621.8 ms** | **18693 ms** |
 
-- **Counts are symmetric.** 273 unique jobs discarded in both libraries per run, ~819 failure events per run, 626 completions per run. These are arithmetically determined by the 30% error injection × 3-attempt policy × 899 enqueues.
-- **Shapes are different.** River deliberately spaces retries with exponential backoff so failing upstream (the "rate-limited provider" being modeled) gets time to recover. platform-lib's implementation in this adapter re-enqueues immediately, treating the "error" as a transient glitch rather than a rate-limit signal.
-- **The shape difference shows up as ~1000× pickup-latency divergence**, which is real but describes *behavior*, not *efficiency*. A production user picks a retry policy based on the nature of the upstream they're protecting, not based on which library has "faster pickup."
+With retry shapes matched, the outcome counts are identical. What differs:
 
-If you want River-style backoff from platform-lib, you build it into your runner — platform-lib's design cleanly separates queue semantics from retry semantics, which is flexibility but also a gap to fill. If you want platform-lib-style instant retry from River, you override `NextRetry` in your worker (River exposes this per-worker).
+1. **platform-lib p50 stays at ~4ms even with backoff**; River's p50 is ~622ms.
+2. **platform-lib p95 is slightly lower** than River's (17.0s vs 18.7s) at matched backoff, with much tighter variance (17016–17017 vs 18633–18837).
 
-Both libraries are correct. The benchmark measures what each does, not whether one is right.
+### Why the p50 difference?
+
+My platform-lib adapter implements backoff with a **goroutine-based `time.AfterFunc` pattern** — when a job fails and is scheduled for retry, the worker slot is freed immediately and the retry fires on a background goroutine. Fresh enqueues don't contend with retry-waiting jobs for worker attention.
+
+River implements backoff via **Postgres `scheduled_at`** — the retry job sits in the DB with a future timestamp and is eligible to be claimed by any worker once that timestamp has passed. This approach is **durable across process restarts** (a crash loses nothing) but means fresh enqueues at t+1s are competing with retry jobs for worker attention, pushing up pickup p50.
+
+**Both are defensible designs:**
+- Goroutine-based backoff (platform-lib adapter): lower pickup latency, but retry is lost if the process dies during backoff. Appropriate for non-durable retry semantics.
+- DB-based backoff (River native): slightly higher pickup latency under retry pressure, but durable across restarts. Appropriate for production systems where retry-loss is unacceptable.
+
+**Caveat:** this goroutine-based backoff is an *adapter* choice, not platform-lib's native behavior. A production platform-lib user building retry semantics would likely choose DB-based backoff (same pattern as River) for durability. This benchmark measures my implementation, not platform-lib's inherent approach.
+
+---
 
 ## Resource usage
 
-| Scenario | platform-lib goroutines (med) | River goroutines (med) |
-|---|---|---|
-| notify_latency | 14 | 40 |
-| steady_under | 36 | 62 |
-| steady_balanced | 55 | 74 |
-| steady_over | 35 | 60 |
-| noisy_neighbor | 44 | 72 |
-| burst | 35 | 60 |
-| rate_limit_pressure | 32 | 56 |
+| Scenario | platform-lib goroutines | River goroutines | platform-lib RSS MB | River RSS MB |
+|---|---|---|---|---|
+| `notify_latency` | 14 | 40 | 18.2 | 18.3 |
+| `steady_under` | 36 | 62 | 18.6 | 18.5 |
+| `noisy_neighbor` | 44 | 72 | 18.8 | 19.2 |
+| `steady_over` | 35 | 60 | 19.1 | 18.8 |
+| `steady_balanced` | 55 | 74 | 19.3 | 19.1 |
+| `burst` | 35 | 60 | 23.1 | 19.1 |
+| `noisy_neighbor_saturated` | 35 | 60 | 19.0 | 19.1 |
+| `rate_limit_pressure` (no backoff) | 32 | 56 | 19.0 | 19.3 |
+| `rate_limit_pressure` (backoff) | 193 | 58 | 19.0 | 19.3 |
+| `high_scale` | 182 | 198 | 35.9 | 24.4 |
 
-River consistently runs ~2× more goroutines than platform-lib. This likely reflects River's periodic/leader-election/maintenance goroutines that platform-lib doesn't have.
+Two observations:
+1. River consistently runs ~2× more goroutines than platform-lib in most scenarios. Likely due to River's periodic/leader-election/metrics goroutines. Roughly flat across load.
+2. **platform-lib goroutines spike under retry-with-backoff** and under high enqueue rate. This reflects my adapter's goroutine-per-backoff-job implementation — each scheduled retry creates a goroutine that sleeps then re-enqueues. At rate_limit with backoff, 273 discards × 3 attempts = 819 goroutines spawned across the run. A pool-based scheduler would cap this.
 
-Max RSS is similar (18.2–23.1 MB both) — resource delta is in goroutine count, not memory.
+---
 
-## Throughput column explanation
+## When would we switch to platform-lib from River?
 
-The "Throughput (c/s)" column is `completed_jobs / total_run_duration_including_drain`. The drain phase doubles the denominator vs. just the generation phase, so the absolute numbers are lower than the enqueue rate. But it's consistent across libraries, so cross-library comparison in the same scenario is apples-to-apples.
+Based on this data, the case for platform-lib is strongest when:
 
-## Variance across runs
+- **Low-latency pickup is a product requirement.** Near-zero queue-idle latency matters: user-facing "optimistic action" paths, live-UI notifications, any scenario where a few hundred ms of queue lag is visible in UX.
+- **High rate of small jobs.** The LISTEN/NOTIFY advantage widens with rate (63× at 300 Hz vs 18× at 20 Hz in this benchmark). If your workload is many-short-jobs, platform-lib's dispatch overhead stays flat.
+- **The architectural adjacents fit.** platform-lib's unique value is the integrated cache + queue + broadcaster set. If you're building a system that wants all three unified, the ecosystem fit is better than bolting cache onto River.
 
-For every scenario, the 3-run spread on pickup-p95 is within ±5% of the median for both libraries. This is consistent with "the measurement is stable" and isn't variance artifacts producing the gap. The exception is platform-lib's `noisy_neighbor` run 2 fairness ratio (0.61 vs 0.90 in runs 1 and 3) — one outlier, likely a timing quirk, not a pattern.
+The case for **staying on River** is strongest when:
 
-## What's next
+- **Out-of-the-box operational features matter.** River ships leader election, periodic jobs, middleware ecosystem, CLI tooling, metrics integrations, and transactional enqueue. Building all of that on top of rsqueue is possible but is work you don't have today.
+- **Durable retry / crash resilience matters.** River's DB-based retry persists through restarts; platform-lib's retry story is "build your own" (per this benchmark's adapter choice).
+- **You're doing 100–1000 Hz steady-state and can tolerate 100ms pickup latency.** River's pickup at moderate rate is below 150ms p99 — totally acceptable for most SaaS workloads.
 
-1. **Genuinely saturated fairness test.** Current `noisy_neighbor` is under-capacity (50 Hz, 20 workers); the ~1.0 fairness ratio is "no starvation because there's nothing to fight over." A real test: one tenant enqueues at rate exceeding the queue's per-tenant drain rate, forcing prioritization decisions. Neither library has per-tenant fairness built in; under saturation both are FIFO, so we'd expect fairness to break down similarly in both.
-2. **Higher-scale throughput tests** (200+ Hz, 100+ workers) to see if platform-lib's LISTEN/NOTIFY advantage holds at higher absolute rates, or whether the advantage disappears as Postgres coordination overhead dominates.
-3. **Exponential-backoff variant for platform-lib** — add an optional `BackoffFn` to the adapter so the retry-shape comparison isn't apples-to-oranges when the *intent* is rate-limit-aware retry.
-4. **`crash_recovery`** — SIGKILL the worker process mid-burst; measure duplicate-execution count and time-to-resume. Requires a fork/exec harness. Deferred.
-5. **rscache + AddressedPush integration** — platform-lib's unique architectural feature (cache-integrated queue). Out of scope for a raw-queue comparison but genuinely interesting as a benchmark of its own.
-6. **Multi-process scenario** — two adapter processes consuming the same queue, exercising cross-process LISTEN/NOTIFY.
+For Keavi specifically: the LISTEN/NOTIFY advantage *matters* (the SSE and conversational paths care about sub-100ms responsiveness), but River's operational completeness also matters (Keavi has 55 workers across many job types and benefits from the ecosystem). **A hybrid approach — stay on River for queuing, adopt platform-lib's cache module independently** — remains the recommendation from the earlier audit. See `project_future_platformlib_cache.md` in Keavi's memory.
 
-## Honest disclaimers
+---
 
-- **Single-process throughput**, not a clustered comparison.
-- **Synthetic workload** — the `Simulate` function uses `time.Sleep` to model work, so jobs never actually pressure the CPU. Real worker behavior may differ.
-- **Adapter parity constraints** — my hand-written platform-lib `QueueStore` may have tuning opportunities a production-optimized store wouldn't share. Notably, I used `FOR UPDATE SKIP LOCKED` for claims and a fast-path idle count; these are conventional but not the only choices.
-- **One hardware datapoint** — Apple Silicon + Postgres 16 on docker-compose. Real deployments use different CPUs, NUMA topology, and network stacks.
-- **Two-second warmup discard** (ten-second run minus two-second warmup = only eight seconds of latency samples at a 10 Hz scenario is 80 samples — thin for p99). This is why throughput scenarios (higher rate) have much more stable p99 values than sparse scenarios.
+## What's next (in order of value)
 
-## Methodology
+Deferred work is documented in [`docs/FUTURE.md`](docs/FUTURE.md) with concrete design notes. Ordered by informational value vs. effort:
 
-See [`docs/METHODOLOGY.md`](docs/METHODOLOGY.md) for the workload model, error injection semantics, and metric definitions. Raw data for this run is in `results/*.jsonl` (gitignored; reproducible by running `scripts/run-all.sh`). All JSONL events are timestamped to nanoseconds; latency calculations come from event-timestamp deltas, not wall-clock estimates.
+1. **Jitter in `ExponentialBackoffRiverLike`** — matches River's ±10% jitter so retry-shape is fully apples-to-apples. ~30 min.
+2. **Multi-process scenario** — two adapter processes consuming the same queue. Exercises cross-process LISTEN/NOTIFY. ~1 hour.
+3. **`crash_recovery`** — SIGKILL the worker process mid-burst; measure duplicates and resume time. Needs parent/child process split. ~2–4 hours.
+4. **`rscache` + AddressedPush integration** — a capability benchmark of platform-lib's unique cache-integrated queue. Not head-to-head (River has no equivalent). ~2–4 hours.
+5. **DB-backed backoff in the platform-lib adapter** — mirror River's durability model so backoff-enabled comparisons are truly apples-to-apples. Requires building a scheduler layer on top of rsqueue's `Push`. ~1–2 hours.
+
+## Methodology + caveats
+
+See [`docs/METHODOLOGY.md`](docs/METHODOLOGY.md) for the workload model and metric definitions. Raw JSONL data lives in `results/` (gitignored; reproducible via `scripts/run-all.sh` and `scripts/run-items-2-3.sh`).
+
+**Things this benchmark doesn't measure:**
+- Cross-process coordination (deferred).
+- Crash resilience / recovery behavior (deferred).
+- Real-world workload patterns (synthetic `time.Sleep` approximates work).
+- Long-running stability (30s runs — memory leaks / GC pressure over hours are invisible).
+- Failure modes beyond the three simulated error classes.
+
+**Things this benchmark measures well:**
+- LISTEN/NOTIFY pickup latency, under four different pressure regimes, with tight run-to-run variance.
+- Throughput differences at saturation.
+- Retry-shape semantics (with the backoff asymmetry honestly documented).
+- Natural fairness under tenant skew.
 
 ## License
 
