@@ -78,13 +78,15 @@ func Run(ctx context.Context, cfg Config) error {
 		workerFn := func(wctx context.Context, job qpkg.Job) error {
 			startedAt := time.Now()
 			_ = rec.Record(metrics.KindJobStarted, map[string]any{
-				"job_id":    string(job.ID),
-				"tenant_id": job.TenantID.String(),
-				"kind":      string(job.Kind),
-				"attempt":   job.Attempt,
+				"job_id":       string(job.ID),
+				"tenant_id":    job.TenantID.String(),
+				"kind":         string(job.Kind),
+				"attempt":      job.Attempt,
+				"started_at_ns": startedAt.UnixNano(),
 			})
 			err := qpkg.Simulate(wctx, job)
 			duration := time.Since(startedAt)
+			completedAt := time.Now()
 			if err != nil {
 				failedCount.Add(1)
 				class := ""
@@ -92,23 +94,25 @@ func Run(ctx context.Context, cfg Config) error {
 					class = string(se.Class)
 				}
 				_ = rec.Record(metrics.KindJobFailed, map[string]any{
-					"job_id":        string(job.ID),
-					"tenant_id":     job.TenantID.String(),
-					"kind":          string(job.Kind),
-					"attempt":       job.Attempt,
-					"duration_ms":   duration.Milliseconds(),
-					"error_class":   class,
-					"error_message": err.Error(),
+					"job_id":          string(job.ID),
+					"tenant_id":       job.TenantID.String(),
+					"kind":            string(job.Kind),
+					"attempt":         job.Attempt,
+					"duration_ms":     duration.Milliseconds(),
+					"completed_at_ns": completedAt.UnixNano(),
+					"error_class":     class,
+					"error_message":   err.Error(),
 				})
 				return err
 			}
 			completedCount.Add(1)
 			_ = rec.Record(metrics.KindJobCompleted, map[string]any{
-				"job_id":      string(job.ID),
-				"tenant_id":   job.TenantID.String(),
-				"kind":        string(job.Kind),
-				"attempt":     job.Attempt,
-				"duration_ms": duration.Milliseconds(),
+				"job_id":          string(job.ID),
+				"tenant_id":       job.TenantID.String(),
+				"kind":            string(job.Kind),
+				"attempt":         job.Attempt,
+				"duration_ms":     duration.Milliseconds(),
+				"completed_at_ns": completedAt.UnixNano(),
 			})
 			return nil
 		}
@@ -170,23 +174,26 @@ func Run(ctx context.Context, cfg Config) error {
 		go func() {
 			defer enqueueWG.Done()
 			for req := range reqs {
-				enqueuedAt := time.Now()
+				submittedAt := time.Now()
 				jobID, err := cfg.Harness.Enqueue(ctx, req.TenantID, req.Kind, req.Payload)
 				if err != nil {
 					_ = rec.Record(metrics.KindJobFailed, map[string]any{
-						"tenant_id":   req.TenantID.String(),
-						"kind":        string(req.Kind),
-						"stage":       "enqueue",
+						"tenant_id":     req.TenantID.String(),
+						"kind":          string(req.Kind),
+						"stage":         "enqueue",
 						"error_message": err.Error(),
 					})
 					continue
 				}
+				enqueuedAt := time.Now()
 				enqueueCount.Add(1)
 				_ = rec.Record(metrics.KindJobEnqueued, map[string]any{
-					"job_id":     string(jobID),
-					"tenant_id":  req.TenantID.String(),
-					"kind":       string(req.Kind),
-					"enqueue_ms": time.Since(enqueuedAt).Milliseconds(),
+					"job_id":          string(jobID),
+					"tenant_id":       req.TenantID.String(),
+					"kind":            string(req.Kind),
+					"submitted_at_ns": submittedAt.UnixNano(),
+					"enqueued_at_ns":  enqueuedAt.UnixNano(),
+					"enqueue_call_ms": enqueuedAt.Sub(submittedAt).Milliseconds(),
 				})
 			}
 		}()

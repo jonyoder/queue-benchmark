@@ -13,6 +13,7 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/jonyoder/queue-benchmark/internal/analyze"
 	"github.com/jonyoder/queue-benchmark/internal/metrics"
 	qpkg "github.com/jonyoder/queue-benchmark/internal/queue"
 	"github.com/jonyoder/queue-benchmark/internal/queue/platlib"
@@ -33,8 +34,10 @@ func main() {
 			os.Exit(1)
 		}
 	case "report":
-		fmt.Fprintln(os.Stderr, "report: not yet implemented (Phase 4)")
-		os.Exit(1)
+		if err := cmdReport(os.Args[2:]); err != nil {
+			fmt.Fprintln(os.Stderr, err)
+			os.Exit(1)
+		}
 	case "-h", "--help", "help":
 		usage()
 	default:
@@ -72,6 +75,9 @@ func cmdRun(args []string) error {
 	resultsDir := fs.String("results-dir", "./results", "where to write JSONL results")
 	workers := fs.Int("workers", 10, "harness worker count")
 	addressedPush := fs.Bool("addressed-push", false, "platform-lib only: use AddressedPush")
+	duration := fs.Duration("duration", 0, "override scenario duration (e.g., 30s)")
+	rate := fs.Int("rate", 0, "override scenario enqueue rate (jobs/sec)")
+	tenants := fs.Int("tenants", 0, "override scenario tenant count")
 	_ = fs.Parse(args)
 
 	if *lib == "" || *scenario == "" || *pgURL == "" {
@@ -82,6 +88,15 @@ func cmdRun(args []string) error {
 	spec, err := workload.SpecFor(workload.Scenario(*scenario))
 	if err != nil {
 		return fmt.Errorf("scenario: %w", err)
+	}
+	if *duration > 0 {
+		spec.Duration = *duration
+	}
+	if *rate > 0 {
+		spec.EnqueueRate = *rate
+	}
+	if *tenants > 0 {
+		spec.Tenants = *tenants
 	}
 
 	// Ctrl-C aware context for clean shutdown.
@@ -135,5 +150,27 @@ func cmdRun(args []string) error {
 	}
 
 	fmt.Fprintf(os.Stdout, "run %s done: results written to %s/%s.jsonl\n", runID, *resultsDir, runID)
+	return nil
+}
+
+func cmdReport(args []string) error {
+	fs := flag.NewFlagSet("report", flag.ExitOnError)
+	resultsDir := fs.String("results-dir", "./results", "directory of JSONL results")
+	out := fs.String("out", "", "optional output path for Markdown report (stdout if empty)")
+	_ = fs.Parse(args)
+
+	summaries, err := analyze.AnalyzeDir(*resultsDir)
+	if err != nil {
+		return fmt.Errorf("analyze: %w", err)
+	}
+	md := analyze.RenderMarkdown(summaries)
+	if *out == "" {
+		fmt.Fprint(os.Stdout, md)
+		return nil
+	}
+	if err := os.WriteFile(*out, []byte(md), 0o644); err != nil {
+		return fmt.Errorf("write report: %w", err)
+	}
+	fmt.Fprintf(os.Stdout, "report: wrote %s\n", *out)
 	return nil
 }
