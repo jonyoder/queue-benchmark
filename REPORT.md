@@ -172,11 +172,17 @@ Based on this data, the case for platform-lib is strongest when:
 
 The case for **staying on River** is strongest when:
 
-- **Out-of-the-box operational features matter.** River ships leader election, periodic jobs, middleware ecosystem, CLI tooling, metrics integrations, and transactional enqueue. Building all of that on top of rsqueue is possible but is work you don't have today.
-- **Durable retry / crash resilience matters.** River's DB-based retry persists through restarts; platform-lib's retry story is "build your own" (per this benchmark's adapter choice).
-- **You're doing 100–1000 Hz steady-state and can tolerate 100ms pickup latency.** River's pickup at moderate rate is below 150ms p99 — totally acceptable for most SaaS workloads.
+- **Adapter complexity matters.** The River adapter in this repo is ~300 lines and uses `riverpgxv5.New(pool)` for a production-tested Postgres driver plus `rivermigrate.Migrate` for automatic schema setup. The platform-lib adapter is ~1,080 lines because platform-lib ships the `QueueStore` interface but not a Postgres implementation — I had to hand-write ~440 lines of Postgres CRUD and a hand-maintained SQL schema. For a team that wants fewer moving parts, River gives you more out of the box.
+- **Leader election is needed.** During these benchmark runs, River's logs showed a live `leadership.Elector` subsystem (e.g., `Current leader stepping down because the reelection deadline elapsed`). River ships this for multi-instance coordination; platform-lib treats it as a composition concern you'd wire on top of `rsnotify`.
+- **Durable retry / crash resilience matters.** River's DB-based retry persists through restarts. platform-lib's retry story is "build your own" — this benchmark's adapter uses `time.AfterFunc`-style goroutines which would lose retries on crash. A durable platform-lib retry would need a scheduler layer on top of `rsqueue.Push`.
+- **You're doing 100–1000 Hz steady-state and can tolerate 100–300 ms pickup latency.** River's pickup at moderate rate is below 150ms p99 at lower rates and ~315ms p99 at 300 Hz — acceptable for most SaaS workloads.
 
-For Keavi specifically: the LISTEN/NOTIFY advantage *matters* (the SSE and conversational paths care about sub-100ms responsiveness), but River's operational completeness also matters (Keavi has 55 workers across many job types and benefits from the ecosystem). **A hybrid approach — stay on River for queuing, adopt platform-lib's cache module independently** — remains the recommendation from the earlier audit. See `project_future_platformlib_cache.md` in Keavi's memory.
+**What I am NOT claiming** (and did not measure in this benchmark):
+
+- Relative quality of middleware ecosystems, CLI tooling, metrics integrations, observability hooks, or documentation. River has `river-cli` and `rivermetrics`; platform-lib has `rsqueue/metrics` with typed hook interfaces you implement yourself. A head-to-head feature matrix would be a separate research task.
+- Transactional enqueue asymmetry. I initially implied platform-lib was weaker here, but `plqueue.Queue.WithDbTx(ctx, tx)` supports the same pattern as River's `InsertTx`. Both can enqueue atomically with an application transaction.
+
+For Keavi specifically: the LISTEN/NOTIFY advantage *matters* (the SSE and conversational paths care about sub-100ms responsiveness), but River's out-of-the-box adapter simplicity and leader-election subsystem also matter (Keavi has 55 workers across many job types; building a custom `QueueStore` + scheduler + leader coordination is work you don't have to do today). **A hybrid approach — stay on River for queuing, adopt platform-lib's cache module independently** — remains the recommendation from the earlier audit. See `project_future_platformlib_cache.md` in Keavi's memory.
 
 ---
 
