@@ -78,6 +78,7 @@ func cmdRun(args []string) error {
 	duration := fs.Duration("duration", 0, "override scenario duration (e.g., 30s)")
 	rate := fs.Int("rate", 0, "override scenario enqueue rate (jobs/sec)")
 	tenants := fs.Int("tenants", 0, "override scenario tenant count")
+	backoff := fs.Bool("backoff", false, "platform-lib only: enable River-like exponential backoff on retry")
 	_ = fs.Parse(args)
 
 	if *lib == "" || *scenario == "" || *pgURL == "" {
@@ -121,7 +122,11 @@ func cmdRun(args []string) error {
 		}
 		harness = h
 	case "platlib":
-		h, err := platlib.New(ctx, cfg, platlib.Options{UseAddressedPush: *addressedPush})
+		pOpts := platlib.Options{UseAddressedPush: *addressedPush}
+		if *backoff {
+			pOpts.BackoffFn = platlib.ExponentialBackoffRiverLike
+		}
+		h, err := platlib.New(ctx, cfg, pOpts)
 		if err != nil {
 			return err
 		}

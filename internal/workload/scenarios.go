@@ -11,13 +11,15 @@ import (
 type Scenario string
 
 const (
-	ScenarioSteadyUnder       Scenario = "steady_under"    // low enqueue rate, excess workers
-	ScenarioSteadyBalanced    Scenario = "steady_balanced" // moderate rate, matched capacity
-	ScenarioSteadyOver        Scenario = "steady_over"     // saturated, workers bottleneck
-	ScenarioBurst             Scenario = "burst"
-	ScenarioNoisyNeighbor     Scenario = "noisy_neighbor"
-	ScenarioRateLimitPressure Scenario = "rate_limit_pressure"
-	ScenarioNotifyLatency     Scenario = "notify_latency"
+	ScenarioSteadyUnder           Scenario = "steady_under"             // low enqueue rate, excess workers
+	ScenarioSteadyBalanced        Scenario = "steady_balanced"          // moderate rate, matched capacity
+	ScenarioSteadyOver            Scenario = "steady_over"              // saturated, workers bottleneck
+	ScenarioBurst                 Scenario = "burst"
+	ScenarioNoisyNeighbor         Scenario = "noisy_neighbor"
+	ScenarioNoisyNeighborSat      Scenario = "noisy_neighbor_saturated" // 90% skew + saturation
+	ScenarioRateLimitPressure     Scenario = "rate_limit_pressure"
+	ScenarioNotifyLatency         Scenario = "notify_latency"
+	ScenarioHighScale             Scenario = "high_scale" // high absolute rate + high workers, under-capacity
 
 	// ScenarioSteady is kept as an alias for steady_over to preserve
 	// backward compatibility with existing results files.
@@ -102,6 +104,35 @@ func SpecFor(name Scenario) (Spec, error) {
 			Seed: 4,
 		}, nil
 
+	case ScenarioNoisyNeighborSat:
+		// One tenant dominates 90% of enqueues against a queue that's
+		// saturated (100 Hz against 10 workers @ ~100ms mean duration =
+		// above capacity). This is the real fairness test: with limited
+		// worker slots, does one tenant's burst crowd out the others?
+		return Spec{
+			Name:        string(name),
+			Duration:    10 * time.Second,
+			Tenants:     10,
+			TenantSkew:  0.9,
+			EnqueueRate: 100,
+			JobMix:      defaultMix(),
+			Seed:        12,
+		}, nil
+
+	case ScenarioHighScale:
+		// High absolute enqueue rate at modestly-under-capacity so
+		// LISTEN/NOTIFY can still matter but Postgres coordination
+		// overhead also comes into play. 300 Hz against 100 workers
+		// @ ~100ms mean = ~30% utilization.
+		return Spec{
+			Name:        string(name),
+			Duration:    15 * time.Second,
+			Tenants:     10,
+			EnqueueRate: 300,
+			JobMix:      defaultMix(),
+			Seed:        13,
+		}, nil
+
 	case ScenarioNotifyLatency:
 		// Sparse zero-work enqueues exercise the LISTEN/NOTIFY path in
 		// isolation — no worker contention, no work to time. 20 Hz gives
@@ -157,7 +188,9 @@ func AllScenarios() []Scenario {
 		ScenarioSteadyOver,
 		ScenarioBurst,
 		ScenarioNoisyNeighbor,
+		ScenarioNoisyNeighborSat,
 		ScenarioRateLimitPressure,
 		ScenarioNotifyLatency,
+		ScenarioHighScale,
 	}
 }

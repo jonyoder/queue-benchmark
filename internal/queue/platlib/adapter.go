@@ -66,6 +66,11 @@ type Harness struct {
 	mu      sync.RWMutex
 	workers map[qpkg.Kind]qpkg.WorkerFunc
 	started bool
+
+	// Background retry goroutines. stopCh closes on Stop; wg tracks
+	// in-flight BackoffFn goroutines so Stop can wait for them.
+	stopCh chan struct{}
+	wg     sync.WaitGroup
 }
 
 // Options lets callers override adapter-specific defaults.
@@ -80,6 +85,39 @@ type Options struct {
 	// Push) to mirror River's behavior. Scenarios that want dedup semantics
 	// can flip this.
 	UseAddressedPush bool
+
+	// BackoffFn returns the delay to wait before re-enqueuing a failed
+	// job. Called with the upcoming attempt number (2 for first retry, 3
+	// for second, etc.). If nil or returns 0, retries are immediate —
+	// the worker that handled the failing attempt returns, the job is
+	// re-enqueued synchronously, and the next available worker picks it
+	// up at LISTEN/NOTIFY speed.
+	//
+	// A non-zero duration schedules the re-enqueue on a background
+	// goroutine so the worker slot is released immediately. The
+	// goroutine respects the harness shutdown signal.
+	//
+	// ExponentialBackoffRiverLike mirrors River's default attempt^4
+	// policy for apples-to-apples comparison of retry shapes.
+	BackoffFn func(nextAttempt int32) time.Duration
+}
+
+// ExponentialBackoffRiverLike mirrors River's default retry policy,
+// which spaces retries by `failed_attempt^4` seconds: after attempt 1
+// fails wait 1s, after attempt 2 fails wait 16s, after attempt 3 fails
+// wait 81s, etc.
+//
+// Argument is the attempt about to be scheduled (i.e., 2 for the first
+// retry, 3 for the second). The failed attempt is therefore
+// `nextAttempt - 1`. Useful as a BackoffFn for apples-to-apples retry-
+// shape comparisons with River.
+func ExponentialBackoffRiverLike(nextAttempt int32) time.Duration {
+	failedAttempt := int64(nextAttempt - 1)
+	if failedAttempt < 1 {
+		failedAttempt = 1
+	}
+	// failedAttempt=1 → 1s, 2 → 16s, 3 → 81s (matches River defaults).
+	return time.Duration(failedAttempt*failedAttempt*failedAttempt*failedAttempt) * time.Second
 }
 
 // New returns an rsqueue-backed harness. Postgres connection is opened,
@@ -164,6 +202,7 @@ func New(ctx context.Context, cfg qpkg.Config, opts Options) (*Harness, error) {
 		stopBroadcast: stopBroadcast,
 		stopQueue:     stopQueue,
 		workers:       make(map[qpkg.Kind]qpkg.WorkerFunc),
+		stopCh:        make(chan struct{}),
 	}
 	return h, nil
 }
@@ -322,6 +361,10 @@ func (h *Harness) Stop(ctx context.Context) error {
 	ag := h.agent
 	h.mu.Unlock()
 
+	// Signal any in-flight BackoffFn goroutines to abandon their retry.
+	close(h.stopCh)
+	h.wg.Wait()
+
 	if ag != nil {
 		if err := ag.Stop(h.cfg.ShutdownTimeout); err != nil && !errors.Is(err, agent.ErrAgentStopTimeout) {
 			return fmt.Errorf("platlib adapter: stop agent: %w", err)
@@ -435,12 +478,34 @@ func (r *benchRunner) Run(ctx context.Context, work plqueue.RecursableWork) erro
 	// Re-enqueue with incremented attempt. The same benchWork.WorkID means
 	// subsequent events still correlate by job_id.
 	bw.Attempt++
+
+	// Backoff: if configured, delay re-enqueue on a background goroutine
+	// so the worker slot is freed immediately.
+	if r.h.opts.BackoffFn != nil {
+		if delay := r.h.opts.BackoffFn(bw.Attempt); delay > 0 {
+			r.h.wg.Add(1)
+			go func(bwCopy benchWork, d time.Duration) {
+				defer r.h.wg.Done()
+				t := time.NewTimer(d)
+				defer t.Stop()
+				select {
+				case <-t.C:
+					// Use a detached context — the harness is still up
+					// (Stop waits for wg) so Push will succeed.
+					_ = r.h.queue.Push(context.Background(), r.h.opts.DefaultPriority, 0, bwCopy)
+				case <-r.h.stopCh:
+					// Harness shutting down — drop the retry.
+					return
+				}
+			}(bw, delay)
+			return nil
+		}
+	}
+
+	// Immediate re-enqueue (no backoff).
 	if err := r.h.queue.Push(ctx, r.h.opts.DefaultPriority, 0, bw); err != nil {
-		// Re-enqueue failed — surface as the job's final outcome.
 		return fmt.Errorf("platlib runner: re-enqueue attempt %d: %w (original: %v)", bw.Attempt, err, workerErr)
 	}
-	// Return nil so the agent removes the current permit; the retry row is
-	// already in flight.
 	return nil
 }
 
