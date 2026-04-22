@@ -266,6 +266,7 @@ func (h *Harness) Enqueue(ctx context.Context, tenantID uuid.UUID, kind qpkg.Kin
 		WorkID:      workID,
 		TenantIDStr: tenantID.String(),
 		KindStr:     string(kind),
+		Attempt:     1,
 		Payload:     payload,
 	}
 
@@ -350,10 +351,12 @@ func (h *Harness) Stop(ctx context.Context) error {
 
 // benchWork is the Work payload carried through rsqueue. Kind and TenantID
 // travel inside it because rsqueue doesn't have first-class tenant scope.
+// Attempt tracks the retry count; the runner increments it on re-enqueue.
 type benchWork struct {
-	WorkID      uint64         `json:"work_id"`
-	TenantIDStr string         `json:"tenant_id"`
-	KindStr     string         `json:"kind"`
+	WorkID      uint64          `json:"work_id"`
+	TenantIDStr string          `json:"tenant_id"`
+	KindStr     string          `json:"kind"`
+	Attempt     int32           `json:"attempt"`
 	Payload     qpkg.JobPayload `json:"payload"`
 }
 
@@ -398,10 +401,47 @@ func (r *benchRunner) Run(ctx context.Context, work plqueue.RecursableWork) erro
 		TenantID:   tenantID,
 		Kind:       kind,
 		Payload:    bw.Payload,
-		Attempt:    1, // rsqueue doesn't track attempts natively; always 1 on first run
-		EnqueuedAt: time.Now(), // best-effort; the Work row has created_at but isn't plumbed through RecursableWork
+		Attempt:    bw.Attempt,
+		EnqueuedAt: time.Now(), // best-effort; rsqueue doesn't plumb Work.CreatedAt through RecursableWork
 	}
-	return fn(ctx, bj)
+	workerErr := fn(ctx, bj)
+	if workerErr == nil {
+		return nil
+	}
+
+	// Retry policy
+	// -------------
+	// rsqueue does not have a built-in retry mechanism — the agent removes
+	// the work row after the runner returns, regardless of error. To mirror
+	// River's default retry-up-to-MaxAttempts behavior, the runner re-
+	// enqueues the job on recoverable errors and returns nil to the agent
+	// so the current permit is released cleanly.
+	//
+	// Permanent simulated errors (benchmark's FailWithError=permanent) do
+	// not retry. Other error classes retry until Attempt == MaxAttempts.
+	//
+	// Caveat: rsqueue's Push has no scheduled-at / delay semantics, so
+	// retries are immediate — unlike River's exponential backoff. This
+	// creates a DIFFERENT retry shape between libraries: platform-lib
+	// re-enqueues quickly against the next available worker; River stages
+	// retries with 1s/16s/81s spacing.
+	if se, simulated := qpkg.IsSimulatedError(workerErr); simulated && se.Class == qpkg.ErrorPermanent {
+		return workerErr // no retry — agent records failure
+	}
+	maxAttempts := int32(r.h.cfg.MaxAttempts)
+	if bw.Attempt >= maxAttempts {
+		return workerErr // exhausted — agent records final failure
+	}
+	// Re-enqueue with incremented attempt. The same benchWork.WorkID means
+	// subsequent events still correlate by job_id.
+	bw.Attempt++
+	if err := r.h.queue.Push(ctx, r.h.opts.DefaultPriority, 0, bw); err != nil {
+		// Re-enqueue failed — surface as the job's final outcome.
+		return fmt.Errorf("platlib runner: re-enqueue attempt %d: %w (original: %v)", bw.Attempt, err, workerErr)
+	}
+	// Return nil so the agent removes the current permit; the retry row is
+	// already in flight.
+	return nil
 }
 
 // chunkNote is a placeholder wire type registered so the broadcaster

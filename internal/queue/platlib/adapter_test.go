@@ -86,6 +86,79 @@ func TestEnqueueAndProcess(t *testing.T) {
 	}
 }
 
+func TestTransientErrorRetries(t *testing.T) {
+	h := newHarness(t, platlib.Options{})
+
+	var attempts atomic.Int32
+	done := make(chan struct{}, 1)
+
+	// Worker fails twice, then succeeds on the third attempt.
+	if err := h.Register("entity_update", func(ctx context.Context, job qpkg.Job) error {
+		n := attempts.Add(1)
+		if n < 3 {
+			return &qpkg.SimulatedError{Class: qpkg.ErrorTransient, Msg: "still failing"}
+		}
+		select {
+		case done <- struct{}{}:
+		default:
+		}
+		return nil
+	}); err != nil {
+		t.Fatalf("Register: %v", err)
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	if err := h.Start(ctx); err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+
+	if _, err := h.Enqueue(ctx, uuid.New(), "entity_update", qpkg.JobPayload{WorkMillis: 1}); err != nil {
+		t.Fatalf("Enqueue: %v", err)
+	}
+
+	select {
+	case <-done:
+		// Expect exactly 3 attempts: fail, fail, success.
+		if got := attempts.Load(); got != 3 {
+			t.Errorf("attempts = %d, want 3 (fail, fail, success)", got)
+		}
+	case <-time.After(20 * time.Second):
+		t.Fatalf("job never succeeded (attempts: %d)", attempts.Load())
+	}
+}
+
+func TestPermanentErrorDoesNotRetry(t *testing.T) {
+	h := newHarness(t, platlib.Options{})
+
+	var attempts atomic.Int32
+	if err := h.Register("entity_update", func(ctx context.Context, job qpkg.Job) error {
+		attempts.Add(1)
+		return &qpkg.SimulatedError{Class: qpkg.ErrorPermanent, Msg: "not recoverable"}
+	}); err != nil {
+		t.Fatalf("Register: %v", err)
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	if err := h.Start(ctx); err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+
+	if _, err := h.Enqueue(ctx, uuid.New(), "entity_update", qpkg.JobPayload{
+		WorkMillis:    1,
+		FailWithError: "permanent",
+	}); err != nil {
+		t.Fatalf("Enqueue: %v", err)
+	}
+
+	// Permanent errors should cause exactly one attempt.
+	time.Sleep(3 * time.Second)
+	if got := attempts.Load(); got != 1 {
+		t.Errorf("permanent-error job ran %d times, want exactly 1", got)
+	}
+}
+
 func TestAddressedPushDedupe(t *testing.T) {
 	h := newHarness(t, platlib.Options{UseAddressedPush: true})
 

@@ -11,11 +11,17 @@ import (
 type Scenario string
 
 const (
-	ScenarioSteady            Scenario = "steady"
+	ScenarioSteadyUnder       Scenario = "steady_under"    // low enqueue rate, excess workers
+	ScenarioSteadyBalanced    Scenario = "steady_balanced" // moderate rate, matched capacity
+	ScenarioSteadyOver        Scenario = "steady_over"     // saturated, workers bottleneck
 	ScenarioBurst             Scenario = "burst"
 	ScenarioNoisyNeighbor     Scenario = "noisy_neighbor"
 	ScenarioRateLimitPressure Scenario = "rate_limit_pressure"
 	ScenarioNotifyLatency     Scenario = "notify_latency"
+
+	// ScenarioSteady is kept as an alias for steady_over to preserve
+	// backward compatibility with existing results files.
+	ScenarioSteady Scenario = "steady"
 )
 
 // SpecFor returns a Spec for the named scenario, with baseline parameters
@@ -24,7 +30,7 @@ const (
 // real scaling apply env-var overrides on top of these defaults in the CLI.
 func SpecFor(name Scenario) (Spec, error) {
 	switch name {
-	case ScenarioSteady:
+	case ScenarioSteady, ScenarioSteadyOver:
 		return Spec{
 			Name:         string(name),
 			Duration:     10 * time.Second,
@@ -33,6 +39,32 @@ func SpecFor(name Scenario) (Spec, error) {
 			EnqueueRate:  50,
 			JobMix:       defaultMix(),
 			Seed:         1,
+		}, nil
+
+	case ScenarioSteadyUnder:
+		// Enqueue rate is well below theoretical worker capacity so pickup
+		// latency reflects LISTEN/NOTIFY overhead + job-dispatch path,
+		// not queue backlog. Use with --workers >= 20 to actually be
+		// under-capacity for the mixed-kind workload's mean duration.
+		return Spec{
+			Name:        string(name),
+			Duration:    10 * time.Second,
+			Tenants:     5,
+			EnqueueRate: 30,
+			JobMix:      defaultMix(),
+			Seed:        10,
+		}, nil
+
+	case ScenarioSteadyBalanced:
+		// Moderate pressure: workers are typically ~50% utilized. Neither
+		// in idle LISTEN/NOTIFY territory nor saturated backlog.
+		return Spec{
+			Name:        string(name),
+			Duration:    10 * time.Second,
+			Tenants:     5,
+			EnqueueRate: 80,
+			JobMix:      defaultMix(),
+			Seed:        11,
 		}, nil
 
 	case ScenarioBurst:
@@ -71,11 +103,14 @@ func SpecFor(name Scenario) (Spec, error) {
 		}, nil
 
 	case ScenarioNotifyLatency:
+		// Sparse zero-work enqueues exercise the LISTEN/NOTIFY path in
+		// isolation — no worker contention, no work to time. 20 Hz gives
+		// ~600 samples in 30s for stable p99.
 		return Spec{
 			Name:        string(name),
 			Duration:    10 * time.Second,
 			Tenants:     1,
-			EnqueueRate: 5, // sparse — one job at a time
+			EnqueueRate: 20,
 			JobMix: []JobClass{
 				{Kind: "entity_update", Weight: 1, WorkMillisMin: 0, WorkMillisMax: 0},
 			},
@@ -117,7 +152,9 @@ func defaultMix() []JobClass {
 // AllScenarios returns every built-in scenario name.
 func AllScenarios() []Scenario {
 	return []Scenario{
-		ScenarioSteady,
+		ScenarioSteadyUnder,
+		ScenarioSteadyBalanced,
+		ScenarioSteadyOver,
 		ScenarioBurst,
 		ScenarioNoisyNeighbor,
 		ScenarioRateLimitPressure,
